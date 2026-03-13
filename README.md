@@ -1,15 +1,24 @@
 # backuppostgres
 
-Production-grade PostgreSQL backup & restore using **pgBackRest** over SSH. Run from any backup host — scripts SSH into your remote PostgreSQL server, install pgBackRest, and manage full/differential/incremental backups with point-in-time recovery.
+Production-grade PostgreSQL backup & restore using **pgBackRest** with a **dedicated backup host** architecture. Backups are stored safely on a separate machine — not on the production database server.
 
 ```
-┌──────────────┐         SSH          ┌──────────────────────┐
-│  Backup Host │ ──────────────────>  │  PostgreSQL Server   │
-│  (you run    │                      │  - pgBackRest        │
-│   scripts    │  backup.sh full      │  - WAL archiving     │
-│   here)      │ <────────────────── │  - Backups stored     │
-└──────────────┘       results        └──────────────────────┘
+┌──────────────────────────┐              ┌──────────────────────────┐
+│  BACKUP HOST (this box)  │     SSH      │  POSTGRESQL SERVER       │
+│                          │ ──────────>  │                          │
+│  - pgBackRest installed  │  streams     │  - PostgreSQL            │
+│  - Backups stored HERE   │  data back   │  - Thin pgBackRest agent │
+│  - You run scripts HERE  │ <──────────  │    (WAL archiving only)  │
+│                          │              │                          │
+└──────────────────────────┘              └──────────────────────────┘
 ```
+
+## Why This Architecture?
+
+- **No risk to production** — backup software and storage are on a separate machine
+- **Backups survive DB server failure** — stored on the backup host, not the DB server
+- **Minimal footprint on PG server** — only a thin agent for WAL shipping
+- **Network isolation** — backup host can be in a different network/DC
 
 ## Quick Start
 
@@ -20,18 +29,19 @@ bash setup.sh
 ```
 
 Interactive prompts will ask for:
-- SSH connection (hostname, user, port)
+- SSH connection to PostgreSQL server (hostname, user, port)
 - PostgreSQL settings (port, superuser, PGDATA path)
-- Backup location on remote server (default: `/var/lib/pgbackrest`)
-- Compression (lz4, zstd, gzip, none)
+- Local backup directory on this machine (default: `/var/lib/pgbackrest`)
+- Compression (lz4, zstd, gzip)
 - Retention policy
 
 The setup script will:
-1. SSH to the remote server
-2. Install pgBackRest
-3. Configure WAL archiving in PostgreSQL
-4. Create and verify the pgBackRest stanza
-5. Save config locally (`.pgbackup.conf`) for backup/restore scripts
+1. Install pgBackRest on **this backup host**
+2. Install thin pgBackRest agent on the **PG server** (via SSH)
+3. Set up SSH keys for bidirectional access (backup ↔ PG server)
+4. Configure `pgbackrest.conf` on both hosts
+5. Configure WAL archiving on the PG server (pushes WALs to this host)
+6. Create and verify the pgBackRest stanza
 
 ### 2. Take Backups
 
@@ -41,92 +51,70 @@ bash backup.sh diff          # Differential — changes since last full (daily)
 bash backup.sh incr          # Incremental — changes since last backup (hourly)
 ```
 
+All backups run **locally** on this machine. pgBackRest automatically SSHes to the PG server to stream data back.
+
 ### 3. Monitor
 
 ```bash
 bash backup.sh info          # View backup details
 bash backup.sh verify        # Verify backup integrity
-bash backup.sh storage       # Show disk usage on remote server
+bash backup.sh storage       # Show local disk usage
 ```
 
 ### 4. Restore
 
 ```bash
-bash restore.sh                              # Interactive — list and choose
-bash restore.sh --latest                     # Restore latest backup
-bash restore.sh --set 20260309-075435F       # Restore specific backup set
-bash restore.sh --pitr '2026-03-09 08:00:00' # Point-in-time recovery
-bash restore.sh --info                       # List available backups
-bash restore.sh --verify                     # Verify integrity
+# Interactive — list backups and choose
+bash restore.sh
+
+# Restore latest backup
+bash restore.sh --latest
+
+# Restore a specific backup set
+bash restore.sh --set 20260309-075435F
+
+# Point-in-time recovery
+bash restore.sh --pitr '2026-03-09 14:30:00+00'
+
+# View available backups / verify
+bash restore.sh --info
+bash restore.sh --verify
 ```
 
-## Backup Location Options
-
-**Default:** backups stored on the remote PG server (path chosen during setup).
-
-**Custom remote path:**
-```bash
-bash backup.sh full --backup-dir /mnt/nfs/pgbackups
-```
-
-**Download to local machine after backup:**
-```bash
-bash backup.sh full --pull /local/backups
-```
+Restore runs from this backup host, streams data to the PG server via SSH, stops/starts PostgreSQL automatically.
 
 ## All Options
 
 ### backup.sh
 
-```
-COMMANDS
-  full                    Full backup
-  diff                    Differential backup (changes since last full)
-  incr                    Incremental backup (changes since last backup)
-  info                    Show backup information
-  verify                  Verify backup integrity
-  storage                 Show backup disk usage
+| Command | Description |
+|---|---|
+| `full` | Full backup |
+| `diff` | Differential (changes since last full) |
+| `incr` | Incremental (changes since last backup) |
+| `info` | Show backup information |
+| `verify` | Verify backup integrity |
+| `storage` | Show backup disk usage |
 
-OPTIONS
-  --backup-dir <dir>      Override backup directory on remote server
-  --pull <local-dir>      Download backup repo to local machine after backup
-  --stanza <name>         Override stanza name
-  --process-max <n>       Override parallel workers
-  --dry-run               Show what would be done without executing
-```
+| Option | Description |
+|---|---|
+| `--stanza <name>` | Override stanza name |
+| `--process-max <n>` | Override parallel workers |
+| `--dry-run` | Show command without executing |
 
 ### restore.sh
 
-```
-  --latest                Restore the latest backup
-  --set <label>           Restore a specific backup set
-  --pitr <timestamp>      Point-in-time recovery (e.g. '2026-03-09 14:30:00+00')
-  --info                  List available backups
-  --verify                Verify backup integrity
-  --no-delta              Full restore (skip delta optimization)
-  --stanza <name>         Override stanza name
-```
+| Option | Description |
+|---|---|
+| `--latest` | Restore the latest backup |
+| `--set <label>` | Restore a specific backup set |
+| `--pitr <timestamp>` | Point-in-time recovery |
+| `--info` | List available backups |
+| `--verify` | Verify backup integrity |
+| `--no-delta` | Full restore (skip delta optimization) |
+| `--stanza <name>` | Override stanza name |
 
-## Backup Types
-
-| Type | What It Backs Up | Size | Restore Speed | Use Case |
-|---|---|---|---|---|
-| **Full** | Everything | Largest | Fastest | Weekly baseline |
-| **Differential** | Changes since last full | Medium | Fast (full + 1 diff) | Daily |
-| **Incremental** | Changes since last backup | Smallest | Slower (full + chain) | Hourly |
-
-## Recommended Schedule
-
-```
-┌─────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
-│         │  Monday  │ Tuesday  │Wednesday │ Thursday │  Friday  │ Saturday │  Sunday  │
-├─────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
-│  2 AM   │   DIFF   │   DIFF   │   DIFF   │   DIFF   │   DIFF   │   DIFF   │  FULL    │
-│ Hourly  │   INCR   │   INCR   │   INCR   │   INCR   │   INCR   │   INCR   │   INCR   │
-└─────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
-```
-
-### Cron Example
+## Recommended Cron Schedule
 
 ```bash
 # Weekly full backup (Sunday 2 AM)
@@ -141,17 +129,18 @@ OPTIONS
 
 ## Prerequisites
 
-- SSH access to the PostgreSQL server (key-based auth recommended)
-- The SSH user must have `sudo` privileges
+- A dedicated backup host (separate machine from the PG server)
+- SSH access from backup host to PG server (key-based auth, set up automatically)
+- The SSH user on PG server must have `sudo` privileges
 - PostgreSQL superuser access on the remote server
 
 ## Files
 
 ```
 backuppostgres/
-├── setup.sh        # One-time: install pgBackRest + configure WAL archiving
-├── backup.sh       # Take full/diff/incr backups via SSH
-└── restore.sh      # Restore via SSH (latest, specific set, PITR)
+├── setup.sh        # One-time: install pgBackRest on both hosts, configure SSH + WAL
+├── backup.sh       # Take full/diff/incr backups (runs locally, streams from PG)
+└── restore.sh      # Restore (runs locally, streams to PG server)
 ```
 
 ## License
