@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
 # ============================================================
-#  restore.sh — Restore PostgreSQL from the dedicated backup host
+#  restore.sh — Restore PostgreSQL from backup
 #
-#  pgBackRest runs LOCALLY on this backup host.
-#  It SSHes to the PG server to restore data from backups stored here.
+#  Supports restoring:
+#    - pg_basebackup archives (tar.gz, tar.lz4, tar)
+#    - pg_dump custom format (.dump)
+#    - pg_dumpall SQL files (.sql, .sql.gz, .sql.lz4)
 #
 #  Usage:
-#    bash restore.sh                              # Interactive
-#    bash restore.sh --latest                     # Restore latest backup
-#    bash restore.sh --set 20260309-075435F       # Restore specific set
-#    bash restore.sh --pitr '2026-03-09 08:00:00' # Point-in-time recovery
-#    bash restore.sh --info                       # List available backups
-#    bash restore.sh --verify                     # Verify integrity
-#
-#  WARNING: Restore stops PostgreSQL, replaces data, and restarts.
+#    bash restore.sh -f backup_file.tar.gz -H <host> -U <user> -W <pass>
+#    bash restore.sh -f dump_mydb.dump -H <host> -U <user> -W <pass> -d mydb
+#    bash restore.sh --list                     # List available backups
+#    bash restore.sh                            # Interactive mode
 # ============================================================
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/.pgbackup.conf"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
@@ -28,244 +23,364 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 
-# ─── Load config ─────────────────────────────────────────────
+# ─── Defaults ─────────────────────────────────────────────────
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    err "Config file not found: ${CONFIG_FILE}"
-    echo "  Run setup.sh first."
-    exit 1
-fi
-
-# shellcheck source=/dev/null
-source "$CONFIG_FILE"
-
-SSH_CMD="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new ${SSH_USER}@${PG_HOST}"
+BACKUP_FILE=""
+PG_HOST=""
+PG_PORT="5432"
+PG_USER="postgres"
+PG_PASS=""
+PG_DB=""
+BACKUP_DIR="./backups"
+RESTORE_DIR=""        # For basebackup: extract to this path
+LIST_ONLY=false
+JOBS=4
 
 # ─── Parse arguments ─────────────────────────────────────────
-
-MODE=""
-SET_LABEL=""
-PITR_TARGET=""
-DELTA=true
 
 usage() {
     echo ""
     echo -e "${BOLD}Usage:${NC} bash restore.sh [options]"
     echo ""
+    echo -e "${BOLD}Required:${NC}"
+    echo "  -f, --file <path>       Backup file to restore"
+    echo "  -H, --host <host>       PostgreSQL server hostname or IP"
+    echo "  -U, --user <user>       PostgreSQL user (default: postgres)"
+    echo "  -W, --password <pass>   PostgreSQL password"
+    echo ""
     echo -e "${BOLD}Options:${NC}"
-    echo "  --latest               Restore the latest backup"
-    echo "  --set <label>          Restore a specific backup set"
-    echo "  --pitr <timestamp>     Point-in-time recovery"
-    echo "  --info                 List available backups"
-    echo "  --verify               Verify backup integrity"
-    echo "  --no-delta             Full restore (don't use delta)"
-    echo "  --stanza <name>        Override stanza name"
-    echo "  --help                 Show this help"
+    echo "  -p, --port <port>       PostgreSQL port (default: 5432)"
+    echo "  -d, --database <db>     Target database (for dump restore)"
+    echo "  -o, --output <dir>      Backup directory to scan (default: ./backups)"
+    echo "  --restore-dir <dir>     Extract basebackup to this directory"
+    echo "  --list                  List available backups"
+    echo "  -j, --jobs <n>          Parallel workers for pg_restore (default: 4)"
+    echo "  --help                  Show this help"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  bash restore.sh --list"
+    echo "  bash restore.sh -f ./backups/dump_mydb_20260313.dump -H localhost -U postgres -W pass -d mydb"
+    echo "  bash restore.sh -f ./backups/basebackup_20260313.tar.gz --restore-dir /var/lib/postgresql/16/main"
     echo ""
     exit 0
 }
 
-if [[ $# -lt 1 ]]; then
-    MODE="interactive"
-else
-    case "$1" in
-        --latest)   MODE="latest"; shift ;;
-        --set)      MODE="set"; SET_LABEL="$2"; shift 2 ;;
-        --pitr)     MODE="pitr"; PITR_TARGET="$2"; shift 2 ;;
-        --info)     MODE="info"; shift ;;
-        --verify)   MODE="verify"; shift ;;
-        --help|-h)  usage ;;
-        *)          err "Unknown option: $1"; usage ;;
-    esac
-fi
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-delta) DELTA=false; shift ;;
-        --stanza)   STANZA="$2"; shift 2 ;;
-        --help|-h)  usage ;;
-        *)          err "Unknown option: $1"; usage ;;
+        -f|--file)        BACKUP_FILE="$2"; shift 2 ;;
+        -H|--host)        PG_HOST="$2"; shift 2 ;;
+        -U|--user)        PG_USER="$2"; shift 2 ;;
+        -W|--password)    PG_PASS="$2"; shift 2 ;;
+        -p|--port)        PG_PORT="$2"; shift 2 ;;
+        -d|--database)    PG_DB="$2"; shift 2 ;;
+        -o|--output)      BACKUP_DIR="$2"; shift 2 ;;
+        --restore-dir)    RESTORE_DIR="$2"; shift 2 ;;
+        --list)           LIST_ONLY=true; shift ;;
+        -j|--jobs)        JOBS="$2"; shift 2 ;;
+        --help|-h)        usage ;;
+        *)                err "Unknown option: $1"; usage ;;
     esac
 done
 
-# ─── Info / Verify ────────────────────────────────────────────
+# ─── List backups ─────────────────────────────────────────────
 
-if [[ "$MODE" == "info" ]]; then
+list_backups() {
     echo ""
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  Available Backups — ${BACKUP_DIR}${NC}"
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Available Backups in ${BACKUP_DIR}${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
     echo ""
-    pgbackrest --stanza="${STANZA}" info
-    echo ""
-    exit 0
-fi
 
-if [[ "$MODE" == "verify" ]]; then
-    log "Verifying backups..."
-    pgbackrest --stanza="${STANZA}" verify
-    success "Verification complete"
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        err "Backup directory not found: ${BACKUP_DIR}"
+        exit 1
+    fi
+
+    local count=0
+    local idx=0
+
+    # List files (dumps, dumpalls) and directories (basebackups)
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        idx=$((idx + 1))
+        local fname=$(basename "$file")
+        local fsize=$(du -sh "$file" 2>/dev/null | awk '{print $1}')
+        local fdate=$(date -r "$file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || stat -c '%y' "$file" 2>/dev/null | cut -d. -f1)
+
+        # Determine type
+        local ftype="unknown"
+        if [[ "$fname" == basebackup_* ]]; then ftype="basebackup"
+        elif [[ "$fname" == dump_* ]]; then ftype="dump"
+        elif [[ "$fname" == dumpall_* ]]; then ftype="dumpall"
+        fi
+
+        # Read metadata if exists
+        local meta_info=""
+        if [[ -f "${file}.meta" ]]; then
+            local meta_host=$(grep '^host=' "${file}.meta" 2>/dev/null | cut -d= -f2)
+            local meta_db=$(grep '^database=' "${file}.meta" 2>/dev/null | cut -d= -f2)
+            meta_info="  host=${meta_host} db=${meta_db}"
+        fi
+
+        printf "  %2d) %-50s %6s  %s  [%s]%s\n" "$idx" "$fname" "$fsize" "$fdate" "$ftype" "$meta_info"
+        count=$((count + 1))
+    done < <({
+        find "$BACKUP_DIR" -maxdepth 1 -type d -name "basebackup_*" 2>/dev/null
+        find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.dump" -o -name "*.sql" -o -name "*.sql.gz" -o -name "*.sql.lz4" \) 2>/dev/null
+    } | sort)
+
+    if [[ $count -eq 0 ]]; then
+        echo "  No backups found in ${BACKUP_DIR}"
+    fi
+    echo ""
+}
+
+if [[ "$LIST_ONLY" == "true" ]]; then
+    list_backups
     exit 0
 fi
 
 # ─── Interactive mode ─────────────────────────────────────────
 
-if [[ "$MODE" == "interactive" ]]; then
-    echo ""
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  PostgreSQL Restore — from ${BACKUP_DIR}${NC}"
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${BOLD}Available backups:${NC}"
-    echo ""
-    pgbackrest --stanza="${STANZA}" info
-    echo ""
-    echo -e "${BOLD}Restore options:${NC}"
-    echo "  1) Restore latest backup"
-    echo "  2) Restore specific backup set"
-    echo "  3) Point-in-time recovery"
-    echo "  4) Cancel"
-    echo ""
-    read -rp "  Select [1-4]: " choice
+if [[ -z "$BACKUP_FILE" ]]; then
+    list_backups
 
-    case "${choice}" in
-        1) MODE="latest" ;;
-        2)
-            read -rp "  Enter backup set label: " SET_LABEL
-            [[ -z "$SET_LABEL" ]] && { err "Label required"; exit 1; }
-            MODE="set"
-            ;;
-        3)
-            read -rp "  Enter target time (e.g. '2026-03-09 14:30:00+00'): " PITR_TARGET
-            [[ -z "$PITR_TARGET" ]] && { err "Target time required"; exit 1; }
-            MODE="pitr"
-            ;;
-        *) echo "  Cancelled."; exit 0 ;;
-    esac
-fi
+    # Collect files into array
+    FILES=()
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        FILES+=("$file")
+    done < <({
+        find "$BACKUP_DIR" -maxdepth 1 -type d -name "basebackup_*" 2>/dev/null
+        find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.dump" -o -name "*.sql" -o -name "*.sql.gz" -o -name "*.sql.lz4" \) 2>/dev/null
+    } | sort)
 
-# ─── Confirm ──────────────────────────────────────────────────
-
-echo ""
-echo -e "${YELLOW}${BOLD}  WARNING: This will restore PostgreSQL on ${PG_HOST}${NC}"
-echo ""
-echo "  What will happen:"
-echo "    1. PostgreSQL on ${PG_HOST} will be STOPPED (via SSH)"
-echo "    2. Data directory (${PG_DATA}) will be REPLACED"
-echo "    3. Restore streams from THIS machine → PG server"
-echo "    4. PostgreSQL will be RESTARTED"
-echo ""
-case "$MODE" in
-    latest) echo "  Restore: Latest backup" ;;
-    set)    echo "  Restore: Backup set ${SET_LABEL}" ;;
-    pitr)   echo "  Restore: PITR to ${PITR_TARGET}" ;;
-esac
-echo ""
-read -rp "  Type 'yes' to proceed: " confirm
-[[ "$confirm" != "yes" ]] && { echo "  Aborted."; exit 0; }
-
-# ─── Stop PostgreSQL on PG server ─────────────────────────────
-
-echo ""
-log "Stopping PostgreSQL on ${PG_HOST}..."
-
-${SSH_CMD} "
-    if command -v systemctl &>/dev/null && systemctl list-units --type=service 2>/dev/null | grep -q postgresql; then
-        SVC=\$(systemctl list-units --type=service 2>/dev/null | grep postgresql | awk '{print \$1}' | head -1)
-        $([ "${SSH_USER}" != "root" ] && echo "sudo") systemctl stop \"\$SVC\"
-    else
-        sudo -u postgres pg_ctl -D '${PG_DATA}' stop -m fast 2>/dev/null || true
+    if [[ ${#FILES[@]} -eq 0 ]]; then
+        err "No backups found in ${BACKUP_DIR}"
+        exit 1
     fi
-"
 
-success "PostgreSQL stopped on ${PG_HOST}"
+    read -rp "  Select backup number: " sel
+    if [[ -z "$sel" || "$sel" -lt 1 || "$sel" -gt ${#FILES[@]} ]] 2>/dev/null; then
+        err "Invalid selection"; exit 1
+    fi
+    BACKUP_FILE="${FILES[$((sel - 1))]}"
+    echo ""
+    log "Selected: $(basename "$BACKUP_FILE")"
 
-# ─── Run pgBackRest restore (from backup host) ───────────────
-
-log "Restoring from backup host to ${PG_HOST}..."
-
-RESTORE_CMD="pgbackrest --stanza='${STANZA}'"
-
-if [[ "$DELTA" == "true" ]]; then
-    RESTORE_CMD+=" --delta"
+    if [[ -z "$PG_HOST" ]]; then
+        read -rp "  PostgreSQL host: " PG_HOST
+        read -rp "  PostgreSQL port [5432]: " input; PG_PORT="${input:-5432}"
+        read -rp "  PostgreSQL user [postgres]: " input; PG_USER="${input:-postgres}"
+        read -rsp "  PostgreSQL password: " PG_PASS; echo ""
+    fi
 fi
 
-RESTORE_CMD+=" --process-max=${PROCESS_MAX}"
+# ─── Validate ─────────────────────────────────────────────────
 
-case "$MODE" in
-    latest)
-        RESTORE_CMD+=" restore"
-        ;;
-    set)
-        RESTORE_CMD+=" --set='${SET_LABEL}' restore"
-        ;;
-    pitr)
-        RESTORE_CMD+=" --type=time --target='${PITR_TARGET}' --target-action=promote restore"
-        ;;
-esac
+if [[ ! -f "$BACKUP_FILE" && ! -d "$BACKUP_FILE" ]]; then
+    err "Backup file not found: ${BACKUP_FILE}"; exit 1
+fi
 
-log "Command: ${RESTORE_CMD}"
+FNAME=$(basename "$BACKUP_FILE")
+
+# Detect backup type from filename
+DETECTED_TYPE="unknown"
+if [[ "$FNAME" == basebackup_* ]]; then DETECTED_TYPE="basebackup"
+elif [[ "$FNAME" == dump_* ]]; then DETECTED_TYPE="dump"
+elif [[ "$FNAME" == dumpall_* ]]; then DETECTED_TYPE="dumpall"
+elif [[ "$FNAME" == *.dump ]]; then DETECTED_TYPE="dump"
+elif [[ "$FNAME" == *.sql* ]]; then DETECTED_TYPE="dumpall"
+elif [[ "$FNAME" == *.tar* ]]; then DETECTED_TYPE="basebackup"
+elif [[ -d "$BACKUP_FILE" ]]; then DETECTED_TYPE="basebackup"
+fi
+
+echo ""
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+echo -e "${BOLD}  Restore: ${FNAME}${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+echo ""
+echo "  File  : ${BACKUP_FILE}"
+echo "  Type  : ${DETECTED_TYPE}"
+echo "  Size  : $(du -sh "$BACKUP_FILE" 2>/dev/null | awk '{print $1}')"
+echo ""
+
 START_TIME=$(date +%s)
 
-eval "${RESTORE_CMD}"
+# ═══════════════════════════════════════════════════════════════
+#  Restore: basebackup
+# ═══════════════════════════════════════════════════════════════
+
+if [[ "$DETECTED_TYPE" == "basebackup" ]]; then
+    if [[ -z "$RESTORE_DIR" ]]; then
+        RESTORE_DIR="${BACKUP_DIR}/restored_${FNAME}"
+        echo "  No --restore-dir specified."
+        read -rp "  Extract to [${RESTORE_DIR}]: " input
+        RESTORE_DIR="${input:-$RESTORE_DIR}"
+    fi
+
+    echo ""
+    warn "This will extract the backup to: ${RESTORE_DIR}"
+    echo ""
+    echo "  To use this as a PostgreSQL data directory:"
+    echo "    1. Stop PostgreSQL"
+    echo "    2. Replace PGDATA with this directory"
+    echo "    3. Start PostgreSQL"
+    echo ""
+    read -rp "  Proceed? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[Nn] ]] && { echo "  Aborted."; exit 0; }
+
+    mkdir -p "$RESTORE_DIR"
+
+    log "Extracting basebackup to ${RESTORE_DIR}..."
+
+    if [[ -d "$BACKUP_FILE" ]]; then
+        # pg_basebackup tar format directory (contains base.tar.gz or base.tar etc.)
+        for tarfile in "$BACKUP_FILE"/*.tar.gz "$BACKUP_FILE"/*.tar; do
+            [[ -f "$tarfile" ]] || continue
+            log "Extracting $(basename "$tarfile")..."
+            if [[ "$tarfile" == *.tar.gz ]]; then
+                tar -xzf "$tarfile" -C "$RESTORE_DIR"
+            else
+                tar -xf "$tarfile" -C "$RESTORE_DIR"
+            fi
+        done
+    elif [[ "$FNAME" == *.tar.gz ]]; then
+        tar -xzf "$BACKUP_FILE" -C "$RESTORE_DIR"
+    elif [[ "$FNAME" == *.tar.lz4 ]]; then
+        lz4 -d "$BACKUP_FILE" - | tar -xf - -C "$RESTORE_DIR"
+    elif [[ "$FNAME" == *.tar ]]; then
+        tar -xf "$BACKUP_FILE" -C "$RESTORE_DIR"
+    fi
+
+    success "Extracted to: ${RESTORE_DIR}"
+    echo ""
+    echo "  Contents:"
+    ls -la "$RESTORE_DIR" | head -20
+    echo ""
+    echo "  To restore on the PostgreSQL server:"
+    echo "    1. Stop PostgreSQL:  sudo systemctl stop postgresql"
+    echo "    2. Backup current:   sudo mv \$PGDATA \$PGDATA.old"
+    echo "    3. Copy restored:    sudo cp -a ${RESTORE_DIR} \$PGDATA"
+    echo "    4. Fix ownership:    sudo chown -R postgres:postgres \$PGDATA"
+    echo "    5. Start PostgreSQL: sudo systemctl start postgresql"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+#  Restore: dump (pg_restore)
+# ═══════════════════════════════════════════════════════════════
+
+if [[ "$DETECTED_TYPE" == "dump" ]]; then
+    if [[ -z "$PG_HOST" ]]; then
+        err "Host required for dump restore (-H)"; exit 1
+    fi
+    if [[ -z "$PG_PASS" ]]; then
+        err "Password required (-W)"; exit 1
+    fi
+
+    export PGPASSWORD="$PG_PASS"
+
+    # Auto-detect database from filename if not specified
+    if [[ -z "$PG_DB" ]]; then
+        PG_DB=$(echo "$FNAME" | sed -n 's/^dump_\(.*\)_[0-9]\{8\}_[0-9]\{6\}\.dump$/\1/p')
+        if [[ -z "$PG_DB" ]]; then
+            read -rp "  Target database name: " PG_DB
+        else
+            echo "  Auto-detected database: ${PG_DB}"
+            read -rp "  Restore to [${PG_DB}]: " input
+            PG_DB="${input:-$PG_DB}"
+        fi
+    fi
+
+    echo ""
+    warn "This will restore into database '${PG_DB}' on ${PG_HOST}:${PG_PORT}"
+    read -rp "  Proceed? [Y/n]: " confirm
+    [[ "$confirm" =~ ^[Nn] ]] && { echo "  Aborted."; exit 0; }
+
+    # Create database if it doesn't exist
+    log "Checking if database '${PG_DB}' exists..."
+    DB_EXISTS=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
+        -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}';" 2>/dev/null)
+
+    if [[ "$DB_EXISTS" != "1" ]]; then
+        log "Creating database '${PG_DB}'..."
+        psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
+            -c "CREATE DATABASE \"${PG_DB}\";" 2>/dev/null
+        success "Database created"
+    fi
+
+    log "Restoring with pg_restore..."
+    pg_restore -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
+        -d "$PG_DB" -v -j "$JOBS" --clean --if-exists \
+        "$BACKUP_FILE" 2>&1 || true
+    # pg_restore returns non-zero on warnings, so we allow it
+
+    success "Dump restored to ${PG_DB}"
+
+    # Validate
+    log "Validating..."
+    TABLE_COUNT=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+        -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null)
+    DB_SIZE=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+        -tAc "SELECT pg_size_pretty(pg_database_size('${PG_DB}'));" 2>/dev/null | tr -d '[:space:]')
+    echo "  Tables: ${TABLE_COUNT}, Size: ${DB_SIZE}"
+
+    unset PGPASSWORD
+fi
+
+# ═══════════════════════════════════════════════════════════════
+#  Restore: dumpall (psql)
+# ═══════════════════════════════════════════════════════════════
+
+if [[ "$DETECTED_TYPE" == "dumpall" ]]; then
+    if [[ -z "$PG_HOST" ]]; then
+        err "Host required for dumpall restore (-H)"; exit 1
+    fi
+    if [[ -z "$PG_PASS" ]]; then
+        err "Password required (-W)"; exit 1
+    fi
+
+    export PGPASSWORD="$PG_PASS"
+
+    echo ""
+    warn "This will restore ALL databases to ${PG_HOST}:${PG_PORT}"
+    warn "Existing databases with the same name will be overwritten!"
+    read -rp "  Type 'yes' to proceed: " confirm
+    [[ "$confirm" != "yes" ]] && { echo "  Aborted."; exit 0; }
+
+    log "Restoring with psql..."
+
+    if [[ "$FNAME" == *.sql.gz ]]; then
+        gunzip -c "$BACKUP_FILE" | psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres 2>&1
+    elif [[ "$FNAME" == *.sql.lz4 ]]; then
+        lz4 -d "$BACKUP_FILE" - | psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres 2>&1
+    else
+        psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -f "$BACKUP_FILE" 2>&1
+    fi
+
+    success "All databases restored"
+
+    # Validate
+    log "Databases on ${PG_HOST}:"
+    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
+        -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) as size FROM pg_database WHERE datistemplate = false ORDER BY datname;" 2>/dev/null
+
+    unset PGPASSWORD
+fi
+
+# ─── Summary ──────────────────────────────────────────────────
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 MINS=$((DURATION / 60))
 SECS=$((DURATION % 60))
 
-success "Restore completed in ${MINS}m ${SECS}s"
-
-# ─── Start PostgreSQL on PG server ────────────────────────────
-
-log "Starting PostgreSQL on ${PG_HOST}..."
-
-${SSH_CMD} "
-    if command -v systemctl &>/dev/null && systemctl list-units --type=service --all 2>/dev/null | grep -q postgresql; then
-        SVC=\$(systemctl list-units --type=service --all 2>/dev/null | grep postgresql | awk '{print \$1}' | head -1)
-        $([ "${SSH_USER}" != "root" ] && echo "sudo") systemctl start \"\$SVC\"
-    else
-        sudo -u postgres pg_ctl -D '${PG_DATA}' start -l /var/log/pgbackrest/pg_startup.log
-    fi
-"
-
-log "Waiting for PostgreSQL to be ready..."
-RETRIES=30
-for i in $(seq 1 $RETRIES); do
-    if ${SSH_CMD} "sudo -u postgres pg_isready -p ${PG_PORT}" &>/dev/null; then
-        break
-    fi
-    if [[ $i -eq $RETRIES ]]; then
-        err "PostgreSQL did not start within ${RETRIES} seconds"
-        exit 1
-    fi
-    sleep 1
-done
-
-success "PostgreSQL started on ${PG_HOST}"
-
-# ─── Validate ─────────────────────────────────────────────────
-
-log "Validating restore..."
 echo ""
-
-DB_LIST=$(${SSH_CMD} "sudo -u postgres psql -p ${PG_PORT} -tAc \"SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;\"" 2>/dev/null)
-
-echo -e "${BOLD}  Databases on ${PG_HOST}:${NC}"
-while IFS= read -r db; do
-    [[ -z "$db" ]] && continue
-    SIZE=$(${SSH_CMD} "sudo -u postgres psql -p ${PG_PORT} -tAc \"SELECT pg_size_pretty(pg_database_size('${db}'));\"" 2>/dev/null | tr -d '[:space:]')
-    echo "    ${db}  (${SIZE})"
-done <<< "$DB_LIST"
-
-echo ""
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
 echo -e "${GREEN}${BOLD}  Restore Complete${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
 echo ""
-echo "  PG Server : ${PG_HOST}"
-echo "  Stanza    : ${STANZA}"
-echo "  PGDATA    : ${PG_DATA}"
+echo "  File      : ${BACKUP_FILE}"
+echo "  Type      : ${DETECTED_TYPE}"
 echo "  Duration  : ${MINS}m ${SECS}s"
-echo "  Backup src: ${BACKUP_DIR} (this machine)"
 echo ""

@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-#  backup.sh — Take pgBackRest backups from the dedicated backup host
+#  backup.sh — PostgreSQL backup using pg_basebackup + pg_dump
 #
-#  pgBackRest runs LOCALLY on this backup host.
-#  It SSHes to the PG server automatically to stream data back here.
-#  Backups are stored LOCALLY on this machine.
+#  Connects to PostgreSQL over its native protocol (port 5432).
+#  No SSH. No extra packages on the server. Just PostgreSQL tools.
 #
 #  Usage:
-#    bash backup.sh full          # Full backup
-#    bash backup.sh diff          # Differential (changes since last full)
-#    bash backup.sh incr          # Incremental (changes since last backup)
-#    bash backup.sh info          # View backup info
-#    bash backup.sh verify        # Verify backup integrity
-#    bash backup.sh storage       # Show backup disk usage
+#    bash backup.sh -H <host> -U <user> -W <password>
+#    bash backup.sh -H <host> -U <user> -W <password> -t dump -d mydb
+#    bash backup.sh    (interactive mode)
 #
-#  Requires: setup.sh has been run first (creates .pgbackup.conf)
+#  Backup types:
+#    basebackup  — Full physical backup (entire cluster, supports PITR)
+#    dump        — Logical SQL dump (single database, portable)
+#    dumpall     — Logical SQL dump (all databases)
 # ============================================================
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/.pgbackup.conf"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
@@ -27,179 +23,247 @@ BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 log()     { echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $*"; }
 success() { echo -e "${GREEN}[OK]${NC} $*"; }
 err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 
-# ─── Load config ─────────────────────────────────────────────
+# ─── Defaults ─────────────────────────────────────────────────
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    err "Config file not found: ${CONFIG_FILE}"
-    echo "  Run setup.sh first to configure the backup host."
-    exit 1
-fi
-
-# shellcheck source=/dev/null
-source "$CONFIG_FILE"
+PG_HOST=""
+PG_PORT="5432"
+PG_USER="postgres"
+PG_PASS=""
+PG_DB=""
+BACKUP_TYPE="basebackup"
+BACKUP_DIR="./backups"
+COMPRESS="gzip"       # gzip, lz4, none
+JOBS=4
+MAX_RATE=""           # e.g. "100M" to limit bandwidth
 
 # ─── Parse arguments ─────────────────────────────────────────
 
-BACKUP_TYPE=""
-
 usage() {
     echo ""
-    echo -e "${BOLD}Usage:${NC} bash backup.sh <command> [options]"
+    echo -e "${BOLD}Usage:${NC} bash backup.sh [options]"
     echo ""
-    echo -e "${BOLD}Commands:${NC}"
-    echo "  full         Take a full backup"
-    echo "  diff         Take a differential backup (changes since last full)"
-    echo "  incr         Take an incremental backup (changes since last backup)"
-    echo "  info         Show backup information"
-    echo "  verify       Verify backup integrity"
-    echo "  storage      Show backup disk usage on this host"
+    echo -e "${BOLD}Required:${NC}"
+    echo "  -H, --host <host>       PostgreSQL server hostname or IP"
+    echo "  -U, --user <user>       PostgreSQL user (default: postgres)"
+    echo "  -W, --password <pass>   PostgreSQL password"
     echo ""
     echo -e "${BOLD}Options:${NC}"
-    echo "  --stanza <name>      Override stanza name (default: from config)"
-    echo "  --process-max <n>    Override parallel workers (default: from config)"
-    echo "  --dry-run            Show what would be done without executing"
-    echo "  --help               Show this help"
+    echo "  -p, --port <port>       PostgreSQL port (default: 5432)"
+    echo "  -t, --type <type>       Backup type: basebackup, dump, dumpall (default: basebackup)"
+    echo "  -d, --database <db>     Database name (required for dump type)"
+    echo "  -o, --output <dir>      Backup output directory (default: ./backups)"
+    echo "  -c, --compress <type>   Compression: gzip, lz4, none (default: gzip)"
+    echo "  -j, --jobs <n>          Parallel workers (default: 4)"
+    echo "  --max-rate <rate>       Max transfer rate, e.g. 100M (default: unlimited)"
+    echo "  --help                  Show this help"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  bash backup.sh full"
-    echo "  bash backup.sh diff --process-max 8"
-    echo "  bash backup.sh info"
+    echo "  bash backup.sh -H 10.0.0.5 -U postgres -W mypass"
+    echo "  bash backup.sh -H db.example.com -U admin -W secret -t dump -d myapp"
+    echo "  bash backup.sh -H 10.0.0.5 -U postgres -W pass -c lz4 -j 8"
     echo ""
     exit 0
 }
 
-DRY_RUN=false
-
-if [[ $# -lt 1 ]]; then
-    usage
-fi
-
-case "${1}" in
-    full|diff|incr)
-        BACKUP_TYPE="$1"
-        shift
-        ;;
-    info|verify|storage)
-        BACKUP_TYPE="$1"
-        shift
-        ;;
-    --help|-h)
-        usage
-        ;;
-    *)
-        err "Unknown command: $1"
-        usage
-        ;;
-esac
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --stanza)
-            STANZA="$2"; shift 2
-            ;;
-        --process-max)
-            PROCESS_MAX="$2"; shift 2
-            ;;
-        --dry-run)
-            DRY_RUN=true; shift
-            ;;
-        --help|-h)
-            usage
-            ;;
-        *)
-            err "Unknown option: $1"
-            usage
-            ;;
+        -H|--host)      PG_HOST="$2"; shift 2 ;;
+        -U|--user)      PG_USER="$2"; shift 2 ;;
+        -W|--password)  PG_PASS="$2"; shift 2 ;;
+        -p|--port)      PG_PORT="$2"; shift 2 ;;
+        -t|--type)      BACKUP_TYPE="$2"; shift 2 ;;
+        -d|--database)  PG_DB="$2"; shift 2 ;;
+        -o|--output)    BACKUP_DIR="$2"; shift 2 ;;
+        -c|--compress)  COMPRESS="$2"; shift 2 ;;
+        -j|--jobs)      JOBS="$2"; shift 2 ;;
+        --max-rate)     MAX_RATE="$2"; shift 2 ;;
+        --help|-h)      usage ;;
+        *)              err "Unknown option: $1"; usage ;;
     esac
 done
 
-# ─── Info / Verify / Storage ─────────────────────────────────
+# ─── Interactive mode ─────────────────────────────────────────
 
-if [[ "$BACKUP_TYPE" == "info" ]]; then
+if [[ -z "$PG_HOST" ]]; then
     echo ""
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  Backup Information — stored at ${BACKUP_DIR}${NC}"
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  PostgreSQL Backup${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
     echo ""
-    pgbackrest --stanza="${STANZA}" info
+    read -rp "  PostgreSQL host: " PG_HOST
+    read -rp "  PostgreSQL port [5432]: " input; PG_PORT="${input:-5432}"
+    read -rp "  PostgreSQL user [postgres]: " input; PG_USER="${input:-postgres}"
+    read -rsp "  PostgreSQL password: " PG_PASS; echo ""
     echo ""
-    exit 0
+    echo "  Backup type:"
+    echo "    1) basebackup — Full physical (entire cluster, PITR capable)"
+    echo "    2) dump       — SQL dump (single database)"
+    echo "    3) dumpall    — SQL dump (all databases)"
+    read -rp "  Select [1]: " bt_choice
+    case "${bt_choice:-1}" in
+        1) BACKUP_TYPE="basebackup" ;;
+        2) BACKUP_TYPE="dump"; read -rp "  Database name: " PG_DB ;;
+        3) BACKUP_TYPE="dumpall" ;;
+    esac
+    read -rp "  Output directory [./backups]: " input; BACKUP_DIR="${input:-./backups}"
+    echo ""
 fi
 
-if [[ "$BACKUP_TYPE" == "verify" ]]; then
-    echo ""
-    log "Verifying backups at ${BACKUP_DIR}..."
-    pgbackrest --stanza="${STANZA}" verify
-    success "Backup verification complete"
-    echo ""
-    exit 0
+# ─── Validate ─────────────────────────────────────────────────
+
+if [[ -z "$PG_HOST" ]]; then err "Host is required (-H)"; exit 1; fi
+if [[ -z "$PG_PASS" ]]; then err "Password is required (-W)"; exit 1; fi
+if [[ "$BACKUP_TYPE" == "dump" && -z "$PG_DB" ]]; then
+    err "Database name required for dump type (-d)"; exit 1
 fi
 
-if [[ "$BACKUP_TYPE" == "storage" ]]; then
-    echo ""
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  Backup Storage — ${BACKUP_DIR}${NC}"
-    echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${BOLD}  Total size:${NC}"
-    du -sh "${BACKUP_DIR}" 2>/dev/null || echo "  (unable to read)"
-    echo ""
-    echo -e "${BOLD}  Breakdown:${NC}"
-    du -sh "${BACKUP_DIR}"/* 2>/dev/null || echo "  (empty)"
-    echo ""
-    echo -e "${BOLD}  Disk free:${NC}"
-    df -h "${BACKUP_DIR}" 2>/dev/null
-    echo ""
-    exit 0
-fi
+export PGPASSWORD="$PG_PASS"
 
-# ─── Take backup ─────────────────────────────────────────────
+# ─── Test connection ──────────────────────────────────────────
+
+log "Connecting to ${PG_HOST}:${PG_PORT} as ${PG_USER}..."
+
+PG_VERSION=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -tAc "SELECT version();" 2>/dev/null) || {
+    err "Cannot connect to PostgreSQL at ${PG_HOST}:${PG_PORT}"
+    echo "  Check: host, port, user, password, and pg_hba.conf on the server"
+    exit 1
+}
+
+success "Connected — ${PG_VERSION}"
+
+# ─── Prepare output ──────────────────────────────────────────
+
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+mkdir -p "$BACKUP_DIR"
 
 echo ""
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}  pgBackRest ${BACKUP_TYPE^^} Backup${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+echo -e "${BOLD}  Starting ${BACKUP_TYPE^^} Backup${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
 echo ""
-echo "  PG Server : ${PG_HOST}"
-echo "  Stanza    : ${STANZA}"
+echo "  Server    : ${PG_HOST}:${PG_PORT}"
+echo "  User      : ${PG_USER}"
 echo "  Type      : ${BACKUP_TYPE}"
-echo "  Workers   : ${PROCESS_MAX}"
-echo "  Compress  : ${COMPRESS_TYPE}"
-echo "  Stored at : ${BACKUP_DIR} (this machine)"
+echo "  Compress  : ${COMPRESS}"
+echo "  Output    : ${BACKUP_DIR}"
 echo ""
 
-PBR_CMD="pgbackrest --stanza='${STANZA}' --type='${BACKUP_TYPE}' --process-max=${PROCESS_MAX} backup"
-
-if [[ "$DRY_RUN" == "true" ]]; then
-    echo "  [DRY RUN] Would execute locally:"
-    echo "    ${PBR_CMD}"
-    echo ""
-    exit 0
-fi
-
-log "Starting ${BACKUP_TYPE} backup (streaming from ${PG_HOST})..."
 START_TIME=$(date +%s)
 
-eval "${PBR_CMD}"
+# ─── basebackup ──────────────────────────────────────────────
+
+if [[ "$BACKUP_TYPE" == "basebackup" ]]; then
+    BACKUP_FILE="${BACKUP_DIR}/basebackup_${TIMESTAMP}.tar"
+
+    BACKUP_FILE="${BACKUP_DIR}/basebackup_${TIMESTAMP}"
+
+    ARGS=(-h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -Ft -Xf -P)
+
+    if [[ -n "$MAX_RATE" ]]; then
+        ARGS+=(--max-rate="$MAX_RATE")
+    fi
+
+    case "$COMPRESS" in
+        gzip)
+            ARGS+=(-z)
+            ;;
+        lz4)
+            ARGS+=(--compress=lz4)
+            ;;
+        none)
+            ;;
+        *)
+            ARGS+=(-z)
+            ;;
+    esac
+
+    ARGS+=(-D "$BACKUP_FILE")
+
+    log "Running pg_basebackup..."
+    pg_basebackup "${ARGS[@]}"
+
+    BACKUP_SIZE=$(du -sh "$BACKUP_FILE" 2>/dev/null | awk '{print $1}')
+    success "Backup saved: ${BACKUP_FILE}/ (${BACKUP_SIZE})"
+fi
+
+# ─── dump ─────────────────────────────────────────────────────
+
+if [[ "$BACKUP_TYPE" == "dump" ]]; then
+    BACKUP_FILE="${BACKUP_DIR}/dump_${PG_DB}_${TIMESTAMP}.dump"
+
+    log "Running pg_dump on '${PG_DB}' (custom format, compressed)..."
+    pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
+        -v --format=custom -f "$BACKUP_FILE" "$PG_DB" 2>&1
+
+    BACKUP_SIZE=$(du -sh "$BACKUP_FILE" 2>/dev/null | awk '{print $1}')
+    success "Backup saved: ${BACKUP_FILE} (${BACKUP_SIZE})"
+fi
+
+# ─── dumpall ──────────────────────────────────────────────────
+
+if [[ "$BACKUP_TYPE" == "dumpall" ]]; then
+    BACKUP_FILE="${BACKUP_DIR}/dumpall_${TIMESTAMP}.sql"
+
+    case "$COMPRESS" in
+        gzip)
+            BACKUP_FILE+=".gz"
+            log "Running pg_dumpall (gzip)..."
+            pg_dumpall -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" 2>/dev/null | gzip > "$BACKUP_FILE"
+            ;;
+        lz4)
+            BACKUP_FILE+=".lz4"
+            log "Running pg_dumpall (lz4)..."
+            pg_dumpall -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" 2>/dev/null | lz4 > "$BACKUP_FILE"
+            ;;
+        none)
+            log "Running pg_dumpall (plain SQL)..."
+            pg_dumpall -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" \
+                -f "$BACKUP_FILE" 2>/dev/null
+            ;;
+        *)
+            BACKUP_FILE+=".gz"
+            log "Running pg_dumpall (gzip)..."
+            pg_dumpall -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" 2>/dev/null | gzip > "$BACKUP_FILE"
+            ;;
+    esac
+
+    BACKUP_SIZE=$(du -sh "$BACKUP_FILE" 2>/dev/null | awk '{print $1}')
+    success "Backup saved: ${BACKUP_FILE} (${BACKUP_SIZE})"
+fi
+
+# ─── Summary ──────────────────────────────────────────────────
 
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 MINS=$((DURATION / 60))
 SECS=$((DURATION % 60))
 
-success "${BACKUP_TYPE^^} backup completed in ${MINS}m ${SECS}s"
+# Save metadata
+META_FILE="${BACKUP_FILE}.meta"
+cat > "$META_FILE" <<EOF
+backup_type=${BACKUP_TYPE}
+host=${PG_HOST}
+port=${PG_PORT}
+user=${PG_USER}
+database=${PG_DB:-all}
+timestamp=${TIMESTAMP}
+file=${BACKUP_FILE}
+size=${BACKUP_SIZE}
+compress=${COMPRESS}
+duration_seconds=${DURATION}
+pg_version=${PG_VERSION}
+EOF
 
-# ─── Show result ──────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}  Backup Complete${NC}"
+echo -e "${BOLD}═══════════════════════════════════════════════${NC}"
+echo ""
+echo "  File      : ${BACKUP_FILE}"
+echo "  Size      : ${BACKUP_SIZE}"
+echo "  Duration  : ${MINS}m ${SECS}s"
+echo "  Metadata  : ${META_FILE}"
+echo ""
 
-echo ""
-log "Current backup status:"
-echo ""
-pgbackrest --stanza="${STANZA}" info
-
-echo ""
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  Backup Complete — stored at ${BACKUP_DIR}${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
-echo ""
+unset PGPASSWORD

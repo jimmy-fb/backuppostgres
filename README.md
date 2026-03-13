@@ -1,146 +1,141 @@
 # backuppostgres
 
-Production-grade PostgreSQL backup & restore using **pgBackRest** with a **dedicated backup host** architecture. Backups are stored safely on a separate machine — not on the production database server.
+Simple PostgreSQL backup & restore scripts. Uses standard PostgreSQL tools (`pg_basebackup`, `pg_dump`, `pg_restore`) — no extra software needed on the server.
 
 ```
-┌──────────────────────────┐              ┌──────────────────────────┐
-│  BACKUP HOST (this box)  │     SSH      │  POSTGRESQL SERVER       │
-│                          │ ──────────>  │                          │
-│  - pgBackRest installed  │  streams     │  - PostgreSQL            │
-│  - Backups stored HERE   │  data back   │  - Thin pgBackRest agent │
-│  - You run scripts HERE  │ <──────────  │    (WAL archiving only)  │
-│                          │              │                          │
-└──────────────────────────┘              └──────────────────────────┘
+┌──────────────────────────┐     PostgreSQL     ┌──────────────────────────┐
+│  ANY Linux/Mac host      │     protocol       │  PostgreSQL Server       │
+│                          │ ──────────────────> │                          │
+│  bash backup.sh          │     (port 5432)     │  Nothing to install.     │
+│  bash restore.sh         │ <────────────────── │  Just PostgreSQL.        │
+└──────────────────────────┘                     └──────────────────────────┘
 ```
 
-## Why This Architecture?
-
-- **No risk to production** — backup software and storage are on a separate machine
-- **Backups survive DB server failure** — stored on the backup host, not the DB server
-- **Minimal footprint on PG server** — only a thin agent for WAL shipping
-- **Network isolation** — backup host can be in a different network/DC
+**No SSH. No pgBackRest. No packages to install on the server. Just `psql`, `pg_basebackup`, `pg_dump`.**
 
 ## Quick Start
 
-### 1. One-Time Setup
+### Backup
 
 ```bash
-bash setup.sh
+# Full physical backup (entire cluster)
+bash backup.sh -H 10.0.0.5 -U postgres -W mypassword
+
+# SQL dump of a single database
+bash backup.sh -H 10.0.0.5 -U postgres -W mypassword -t dump -d myapp
+
+# Dump all databases
+bash backup.sh -H 10.0.0.5 -U postgres -W mypassword -t dumpall
+
+# Interactive mode (prompts for everything)
+bash backup.sh
 ```
 
-Interactive prompts will ask for:
-- SSH connection to PostgreSQL server (hostname, user, port)
-- PostgreSQL settings (port, superuser, PGDATA path)
-- Local backup directory on this machine (default: `/var/lib/pgbackrest`)
-- Compression (lz4, zstd, gzip)
-- Retention policy
-
-The setup script will:
-1. Install pgBackRest on **this backup host**
-2. Install thin pgBackRest agent on the **PG server** (via SSH)
-3. Set up SSH keys for bidirectional access (backup ↔ PG server)
-4. Configure `pgbackrest.conf` on both hosts
-5. Configure WAL archiving on the PG server (pushes WALs to this host)
-6. Create and verify the pgBackRest stanza
-
-### 2. Take Backups
+### Restore
 
 ```bash
-bash backup.sh full          # Full backup (weekly)
-bash backup.sh diff          # Differential — changes since last full (daily)
-bash backup.sh incr          # Incremental — changes since last backup (hourly)
-```
+# List available backups
+bash restore.sh --list
 
-All backups run **locally** on this machine. pgBackRest automatically SSHes to the PG server to stream data back.
+# Restore a database dump
+bash restore.sh -f ./backups/dump_myapp_20260313.dump -H 10.0.0.5 -U postgres -W mypassword -d myapp
 
-### 3. Monitor
+# Extract a physical backup
+bash restore.sh -f ./backups/basebackup_20260313 --restore-dir /tmp/pg_restored
 
-```bash
-bash backup.sh info          # View backup details
-bash backup.sh verify        # Verify backup integrity
-bash backup.sh storage       # Show local disk usage
-```
-
-### 4. Restore
-
-```bash
-# Interactive — list backups and choose
+# Interactive mode
 bash restore.sh
-
-# Restore latest backup
-bash restore.sh --latest
-
-# Restore a specific backup set
-bash restore.sh --set 20260309-075435F
-
-# Point-in-time recovery
-bash restore.sh --pitr '2026-03-09 14:30:00+00'
-
-# View available backups / verify
-bash restore.sh --info
-bash restore.sh --verify
 ```
 
-Restore runs from this backup host, streams data to the PG server via SSH, stops/starts PostgreSQL automatically.
+## Backup Types
+
+| Type | Command | What It Does | Use Case |
+|---|---|---|---|
+| **basebackup** | `-t basebackup` | Full physical copy of entire cluster | Disaster recovery, PITR |
+| **dump** | `-t dump -d mydb` | Logical SQL dump of one database | Single DB backup, migration |
+| **dumpall** | `-t dumpall` | Logical dump of all databases + roles | Full logical backup |
 
 ## All Options
 
 ### backup.sh
 
-| Command | Description |
-|---|---|
-| `full` | Full backup |
-| `diff` | Differential (changes since last full) |
-| `incr` | Incremental (changes since last backup) |
-| `info` | Show backup information |
-| `verify` | Verify backup integrity |
-| `storage` | Show backup disk usage |
-
-| Option | Description |
-|---|---|
-| `--stanza <name>` | Override stanza name |
-| `--process-max <n>` | Override parallel workers |
-| `--dry-run` | Show command without executing |
+```
+  -H, --host <host>       PostgreSQL server hostname or IP
+  -U, --user <user>       PostgreSQL user (default: postgres)
+  -W, --password <pass>   PostgreSQL password
+  -p, --port <port>       PostgreSQL port (default: 5432)
+  -t, --type <type>       basebackup, dump, dumpall (default: basebackup)
+  -d, --database <db>     Database name (required for dump)
+  -o, --output <dir>      Output directory (default: ./backups)
+  -c, --compress <type>   gzip, lz4, none (default: gzip)
+  -j, --jobs <n>          Parallel workers (default: 4)
+  --max-rate <rate>       Max transfer rate (e.g. 100M)
+```
 
 ### restore.sh
 
-| Option | Description |
-|---|---|
-| `--latest` | Restore the latest backup |
-| `--set <label>` | Restore a specific backup set |
-| `--pitr <timestamp>` | Point-in-time recovery |
-| `--info` | List available backups |
-| `--verify` | Verify backup integrity |
-| `--no-delta` | Full restore (skip delta optimization) |
-| `--stanza <name>` | Override stanza name |
-
-## Recommended Cron Schedule
-
-```bash
-# Weekly full backup (Sunday 2 AM)
-0 2 * * 0  /opt/backuppostgres/backup.sh full  >> /var/log/pgbackup.log 2>&1
-
-# Daily differential (Mon-Sat 2 AM)
-0 2 * * 1-6  /opt/backuppostgres/backup.sh diff >> /var/log/pgbackup.log 2>&1
-
-# Hourly incremental
-0 * * * *  /opt/backuppostgres/backup.sh incr >> /var/log/pgbackup.log 2>&1
+```
+  -f, --file <path>       Backup file/directory to restore
+  -H, --host <host>       PostgreSQL server hostname or IP
+  -U, --user <user>       PostgreSQL user (default: postgres)
+  -W, --password <pass>   PostgreSQL password
+  -p, --port <port>       PostgreSQL port (default: 5432)
+  -d, --database <db>     Target database (for dump restore)
+  -o, --output <dir>      Backup directory to scan (default: ./backups)
+  --restore-dir <dir>     Extract basebackup to this directory
+  --list                  List available backups
+  -j, --jobs <n>          Parallel workers for pg_restore (default: 4)
 ```
 
 ## Prerequisites
 
-- A dedicated backup host (separate machine from the PG server)
-- SSH access from backup host to PG server (key-based auth, set up automatically)
-- The SSH user on PG server must have `sudo` privileges
-- PostgreSQL superuser access on the remote server
+On the machine running the scripts, you need PostgreSQL client tools:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install postgresql-client
+
+# RHEL/CentOS
+sudo yum install postgresql
+
+# macOS
+brew install postgresql
+```
+
+The PostgreSQL **server** needs nothing extra — just standard PostgreSQL.
+
+For `basebackup`, the server's `pg_hba.conf` must allow replication connections:
+```
+host  replication  all  <your-ip>/32  md5
+```
+
+## Cron Schedule Example
+
+```bash
+# Weekly full physical backup (Sunday 2 AM)
+0 2 * * 0  /opt/backuppostgres/backup.sh -H db.example.com -U postgres -W "$PG_PASS" -o /backups >> /var/log/pgbackup.log 2>&1
+
+# Daily database dump (Mon-Sat 2 AM)
+0 2 * * 1-6  /opt/backuppostgres/backup.sh -H db.example.com -U postgres -W "$PG_PASS" -t dump -d myapp -o /backups >> /var/log/pgbackup.log 2>&1
+```
+
+## Testing
+
+Run the full test suite (requires Docker):
+
+```bash
+bash test.sh
+```
+
+Tests all 3 backup types + dump restore with data validation + basebackup extraction.
 
 ## Files
 
 ```
 backuppostgres/
-├── setup.sh        # One-time: install pgBackRest on both hosts, configure SSH + WAL
-├── backup.sh       # Take full/diff/incr backups (runs locally, streams from PG)
-└── restore.sh      # Restore (runs locally, streams to PG server)
+├── backup.sh       # Take backups (basebackup / dump / dumpall)
+├── restore.sh      # Restore from backups
+└── test.sh         # End-to-end test suite (Docker)
 ```
 
 ## License
