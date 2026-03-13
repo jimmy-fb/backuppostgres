@@ -154,8 +154,6 @@ START_TIME=$(date +%s)
 # ─── basebackup ──────────────────────────────────────────────
 
 if [[ "$BACKUP_TYPE" == "basebackup" ]]; then
-    BACKUP_FILE="${BACKUP_DIR}/basebackup_${TIMESTAMP}.tar"
-
     BACKUP_FILE="${BACKUP_DIR}/basebackup_${TIMESTAMP}"
 
     ARGS=(-h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -Ft -Xf -P)
