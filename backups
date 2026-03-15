@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# =========================
+# Config
+# =========================
+PGHOST="${PGHOST:-127.0.0.1}"
+PGPORT="${PGPORT:-5432}"
+PGUSER="${PGUSER:-backup_user}"
+export PGPASSWORD="${PGPASSWORD:-change_me}"
+
+BACKUP_ROOT="${BACKUP_ROOT:-/backup/pg}"
+INC_DIR="$BACKUP_ROOT/incremental"
+LOG_DIR="$BACKUP_ROOT/logs"
+LATEST_LINK="$BACKUP_ROOT/latest"
+
+DATE_TAG="$(date +%F_%H-%M-%S)"
+TARGET_DIR="$INC_DIR/$DATE_TAG"
+
+mkdir -p "$INC_DIR" "$LOG_DIR"
+
+LOG_FILE="$LOG_DIR/incremental_$DATE_TAG.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+if [[ ! -L "$LATEST_LINK" && ! -d "$LATEST_LINK" ]]; then
+  echo "No previous backup found. Run a full backup first."
+  exit 1
+fi
+
+REFERENCE_BACKUP="$(readlink -f "$LATEST_LINK" || realpath "$LATEST_LINK")"
+MANIFEST_FILE="$REFERENCE_BACKUP/backup_manifest"
+
+if [[ ! -f "$MANIFEST_FILE" ]]; then
+  echo "Reference manifest not found: $MANIFEST_FILE"
+  exit 1
+fi
+
+mkdir -p "$TARGET_DIR"
+
+echo "[$(date)] Starting INCREMENTAL backup"
+echo "Reference backup: $REFERENCE_BACKUP"
+echo "Manifest: $MANIFEST_FILE"
+echo "Target: $TARGET_DIR"
+
+pg_basebackup \
+  -h "$PGHOST" \
+  -p "$PGPORT" \
+  -U "$PGUSER" \
+  -D "$TARGET_DIR" \
+  -Fp \
+  -X stream \
+  -c fast \
+  -P \
+  --incremental="$MANIFEST_FILE"
+
+echo "[$(date)] INCREMENTAL backup completed: $TARGET_DIR"
+
+# Update latest pointer so next incremental can chain from the most recent backup
+ln -sfn "$TARGET_DIR" "$LATEST_LINK"
+
+echo "[$(date)] Symlink updated: $LATEST_LINK -> $TARGET_DIR"
