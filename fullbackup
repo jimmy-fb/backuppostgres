@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# =========================
+# Config
+# =========================
+PGHOST="${PGHOST:-127.0.0.1}"
+PGPORT="${PGPORT:-5432}"
+PGUSER="${PGUSER:-backup_user}"
+export PGPASSWORD="${PGPASSWORD:-change_me}"
+
+BACKUP_ROOT="${BACKUP_ROOT:-/backup/pg}"
+FULL_DIR="$BACKUP_ROOT/full"
+LOG_DIR="$BACKUP_ROOT/logs"
+
+DATE_TAG="$(date +%F_%H-%M-%S)"
+TARGET_DIR="$FULL_DIR/$DATE_TAG"
+
+mkdir -p "$FULL_DIR" "$LOG_DIR"
+
+LOG_FILE="$LOG_DIR/full_$DATE_TAG.log"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "[$(date)] Starting FULL backup to $TARGET_DIR"
+
+# Plain format is easier for incremental chains later.
+pg_basebackup \
+  -h "$PGHOST" \
+  -p "$PGPORT" \
+  -U "$PGUSER" \
+  -D "$TARGET_DIR" \
+  -Fp \
+  -X stream \
+  -c fast \
+  -P
+
+echo "[$(date)] FULL backup completed: $TARGET_DIR"
+
+# Keep a pointer to latest successful backup
+ln -sfn "$TARGET_DIR" "$BACKUP_ROOT/latest"
+
+echo "[$(date)] Symlink updated: $BACKUP_ROOT/latest -> $TARGET_DIR"
